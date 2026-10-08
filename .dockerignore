@@ -1,0 +1,30 @@
+# Build output and caches
+build/
+build-*/
+out/
+bin/
+.gradle/
+.kotlin/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+
+# VCS, tooling and docs not needed in the image
+.git/
+.gitignore
+.gitattributes
+.claude/
+docs/
+HELP.md
+README.md
+PROGRESS.md
+
+# Container files themselves
+Dockerfile
+.dockerignore
+docker-compose.yml

@@ -1,0 +1,68 @@
+# ledger-service + a single-replica TigerBeetle (development mode).
+#
+#   docker compose --profile init run --rm tigerbeetle-format   # once, creates the data file
+#   docker compose up -d --build
+#
+# The full POC stack (HAProxy, 2 replicas, Prometheus, Grafana, ...) lives elsewhere.
+
+x-tigerbeetle: &tigerbeetle
+  image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
+  # Docker 25+ blocks io_uring under the default seccomp profile.
+  security_opt:
+    - seccomp=unconfined
+  # Docker Desktop (macOS) otherwise fails with "error: SystemResources" (memory locking).
+  cap_add:
+    - IPC_LOCK
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+  volumes:
+    - tigerbeetle-data:/data
+
+services:
+  tigerbeetle-format:
+    <<: *tigerbeetle
+    profiles: [init]
+    command: format --cluster=0 --replica=0 --replica-count=1 --development /data/0_0.tigerbeetle
+
+  tigerbeetle:
+    <<: *tigerbeetle
+    command: start --addresses=0.0.0.0:3000 --development --cache-grid=256MiB /data/0_0.tigerbeetle
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  ledger-service:
+    build: .
+    image: ledger-service:local
+    # The TigerBeetle Java client also uses io_uring on Linux; without this the native client panics
+    # ("io_uring is not available") and takes the JVM down.
+    security_opt:
+      - seccomp=unconfined
+    ports:
+      - "8081:8081"
+    environment:
+      POC_TIGERBEETLE_ADDRESSES: tigerbeetle:3000
+      # "test" enables POST /internal/v1/fundings for the POC. Production omits it.
+      SPRING_PROFILES_ACTIVE: test
+      JAVA_OPTS: "${LEDGER_JAVA_OPTS:--XX:+UseZGC -XX:InitialRAMPercentage=75 -XX:MaxRAMPercentage=75 -XX:+AlwaysPreTouch -XX:+ExitOnOutOfMemoryError --enable-native-access=ALL-UNNAMED}"
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/actuator/health/readiness"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      # Bootstrap waits up to 60 s for TigerBeetle (D27).
+      start_period: 70s
+      start_interval: 2s
+    depends_on:
+      tigerbeetle:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  tigerbeetle-data:

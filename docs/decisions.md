@@ -1,0 +1,64 @@
+# ledger-service — decisions
+
+This file records choices made where the spec (`docs/Send Money POC v2 — SRS & Design Spec.md`) is silent, wrong for the pinned versions, or adapted to a standalone repository. Each entry gives the choice and the reason.
+
+## Repository and build
+
+| # | Decision | Why |
+| --- | --- | --- |
+| D1 | Standalone single Gradle project with Kotlin DSL (`build.gradle.kts`, `settings.gradle.kts`) and a version catalog (`gradle/libs.versions.toml`). The contract lives at `openapi/ledger-api.yaml`, not the monorepo's `contracts/`. | The spec assumes a monorepo (§10). NFR-12 asks for Kotlin DSL + version catalog. |
+| D2 | Root package `com.bracits.ledgerservice` (spec: `com.poc.ledger`). | Keeps the existing scaffold (user's choice). |
+| D3 | No Error Prone, Checkstyle or JaCoCo for now. | User decision. NFR-11's convention plugin belongs to the monorepo build-logic. |
+| D4 | No springdoc / Swagger UI. `openapi/ledger-api.yaml` is copied into `static/openapi.yaml` at build time and served at `GET /openapi.yaml`. | The brief makes springdoc optional. Keeping one authoritative contract file avoids drift and an extra dependency. |
+| D5 | Spring Boot 4.1.1 ships Spring Framework **7.0.9**. `@ConcurrencyLimit(policy = REJECT)` is available in it (since 7.0.3). | Verified against `spring-boot-dependencies-4.1.1.pom`. |
+
+## TigerBeetle
+
+| # | Decision | Why |
+| --- | --- | --- |
+| D6 | `tigerbeetle-java` and the Docker image `ghcr.io/tigerbeetle/tigerbeetle` are both pinned to **0.17.9**. | The client and the cluster must match. 0.17.5–0.17.7 have a known crash bug. |
+| D7 | **The result model changed in 0.17**: `create_transfers` returns one result per event (`CreateTransferStatus` + timestamp), including successes (`Created`). The spec (§8.2) assumes "results only for failures". Mapping: all `Created` → POSTED `replay=false`; all `Exists` → POSTED `replay=true` (timestamp = original transfer's); otherwise the root cause is the first status that is not `Created`/`Exists`/`LinkedEventFailed`. | Verified against the 0.17.9 client source and the TigerBeetle docs. The spec's semantics are kept and only the mechanics are adapted. |
+| D8 | If a chain returns only `Exists` + `LinkedEventFailed` (some legs exist, some don't), the store looks up all leg IDs. All found → POSTED `replay=true`; otherwise 409 `POSTING_CONFLICT`. | A replay must never be reported unless every leg is really posted. |
+| D9 | `IdAlreadyFailed` → 422 `PREVIOUSLY_REJECTED` (definitive). | TigerBeetle permanently fails an ID that failed with a transient error (e.g. `ExceedsCredits`), so that posting can never succeed. Mapping it to 500 would leave transaction-service rows stuck in INITIATED forever. |
+| D10 | A result count that differs from the leg count, and any status not listed in §8.2, → 500 `LEDGER_ERROR` with an error log. | Spec: "any other code → 500, alert". |
+| D11 | The POSTED timestamp is the TigerBeetle timestamp of the **last** leg. | The spec needs one `timestamp` per posting. Leg timestamps in one batch are consecutive, and the last one is when the chain completed. |
+| D12 | Hostnames in `poc.tigerbeetle.addresses` are resolved to IP addresses before the client is created. | Compose uses `tigerbeetle:3000`. Resolving first avoids relying on the native client's hostname support. |
+| D13 | The old client is closed on a separate virtual thread after the fencing swap. The swap is a CAS on the client the failed request used, so concurrent timeouts fence once. | `Client.close()` waits for in-flight requests and must not block the request that triggered the fence. |
+| D14 | Every TigerBeetle operation (create, lookup, balance, health) uses the 800 ms deadline and fences on timeout or client error. Non-posting operations then return 503 `LEDGER_TIMEOUT`. | The brief: "On timeout or client error: create a new client". It is simplest to apply this uniformly. |
+| D15 | Compose and the integration test run TigerBeetle with `--development` and `--cache-grid=256MiB`. | Laptops and Docker Desktop lack Direct I/O and the default 16 GiB grid cache. Production flags are an ops concern. |
+
+## API
+
+| # | Decision | Why |
+| --- | --- | --- |
+| D16 | Account and posting IDs are UUID strings on the wire. The 128-bit TigerBeetle ID is UUID MSB = high 64 bits and LSB = low 64 bits (`UInt128.asBytes(UUID)`), so `00000000-0000-0000-0000-0000000000c8` = 200. | It matches spec §12's configuration format and PostgreSQL's `uuid` column. |
+| D17 | Legs are **1-based**: transfer id = `postingId \| n` for n = 1..8, and `legIndex` in a 422 is 1-based. | Spec §6.3 ("n = 1–4") and the 422 example (`legIndex:1` = principal leg). |
+| D18 | Errors are RFC 9457 `ProblemDetail` (`application/problem+json`). The spec's body fields become extension members: `code`, `postingId`, `legIndex`, and `postingStatus` (`REJECTED`/`UNKNOWN`). | RFC 9457 reserves `status` for the HTTP status code. |
+| D19 | `RejectionCode` = `INSUFFICIENT_FUNDS`, `ACCOUNT_NOT_FOUND`, `PREVIOUSLY_REJECTED` (all 422), `POSTING_CONFLICT` (409), `LEDGER_ERROR` (500). Other codes: `VALIDATION_FAILED` 400, `ACCOUNT_CONFLICT` 409, `ACCOUNT_NOT_FOUND` 404 on balance, `LEDGER_TIMEOUT` 503, `OVERLOADED` 503. Both 503s carry `Retry-After: 1`. | One machine-readable vocabulary for transaction-service. |
+| D20 | The fixed system accounts are a domain enum `SystemAccount` (`FEE_INCOME` 200, `VAT_PAYABLE` 210, `COMMISSION_PAYABLE` 220, `EMONEY_ISSUANCE` 900), id = code in the low bytes. They are created at startup with ledger 1 and no flags. | Spec §6.2. The IDs are derived from the codes, so no configuration is needed. transaction-service reads them from its own configuration (see the README). |
+| D21 | Account flags on the wire are an array of names (`["DEBITS_MUST_NOT_EXCEED_CREDITS"]`); the adapter maps them to TigerBeetle's bit flags. | Readable contract; the domain stays free of TigerBeetle types. |
+| D22 | Balance: TigerBeetle's 128-bit amounts are converted with `longValueExact`. `available = creditsPosted − debitsPosted − debitsPending` (credit-normal; it is negative for the issuance account). | Money is `long` minor units. Customer wallets are credit-normal. |
+| D23 | `POST /internal/v1/fundings` (profile `test`): `{fundingId, accountId, amount}` → a single transfer issuance → account, code 1, `user_data_32 = 0`, posted through the same path and responses as postings. `fundingId` follows the postingId rules (low byte 0). | Spec §6.2: "Funding uses code 1 (issuance → wallet), single transfer". A client-supplied ID keeps it idempotent. |
+| D24 | `GET /internal/v1/postings/{postingId}?legs=n` (n 1–8) returns POSTED (with the last leg's timestamp) only when all n leg IDs exist; otherwise NOT_FOUND. | A linked chain is all-or-nothing, so a partial result means "not posted". |
+| D25 | `POST /internal/v1/accounts` returns `{accountId, status: CREATED\|EXISTS}` (201/200). Account codes and leg codes must be 1–65535 (TigerBeetle u16, non-zero). | Spec §7.2 plus TigerBeetle constraints. |
+| D26 | Validation uses Bean Validation on the request records (shape) plus domain invariants in `Posting` (low byte of postingId = 0, non-zero account IDs, amounts > 0, 1..max legs). Both return 400 `VALIDATION_FAILED`. | Spec §7.2 validation rules. |
+
+## Runtime
+
+| # | Decision | Why |
+| --- | --- | --- |
+| D27 | Bootstrap retries every 1 s for up to 60 s while TigerBeetle starts, then fails startup. `ExistsWithDifferent*` on a system account also fails startup. | Compose starts the service and TigerBeetle together. A mis-configured chart of accounts must not serve traffic. |
+| D28 | Readiness group = `readinessState` + `tigerbeetle` (it looks up the issuance account within the deadline). Liveness = `livenessState` only. | Spec §7.2: "Readiness = TigerBeetle reachable". A dependency in liveness would make the platform restart healthy pods during a TigerBeetle outage. |
+| D29 | JSON logs via Spring Boot structured logging (`logging.structured.format.console=ecs`), with `postingId` in the MDC. Request and response bodies are never logged. | Spec P15 with no extra logging framework. |
+| D30 | Deferred: async log appender, OpenTelemetry trace export, HAProxy and 2 replicas in compose (compose runs one instance; the service is stateless, so scale by adding replicas), Toxiproxy fault suite, k6 load tests. | Outside this repository's brief, or a later milestone (M4/M6). |
+| D31 | Code style: a dedicated mapper class for every model conversion (API ↔ domain, domain ↔ TigerBeetle). No hard-coded strings: closed value sets are enums, other literals live in one constants class per layer. | User's coding rules. |
+| D32 | If a replacement client cannot be created during a fence, the holder clears the slot (`null`), still closes the old client, and counts the fence. The next request creates a client lazily or fails with 503. The service also starts if the first client cannot be created. | The fencing guarantee holds even when a new client cannot be created. A TigerBeetle outage at startup never crashes the JVM; readiness reports it instead. |
+| D33 | `Created` mixed with other statuses but with no root cause (should never happen) takes the D8 lookup path, logged at error, instead of `LEDGER_ERROR`. | The service must never report a rejection when money may have moved. |
+| D34 | `legIndex`: the root-cause leg; in a D8 conflict, the first leg the lookup could not find; on a result-count mismatch, 1. Every `Rejected` problem (409/422/500) carries `postingId`, `postingStatus: REJECTED` and `legIndex`. `Unknown` carries `postingId` and `postingStatus: UNKNOWN`. Account problems carry `accountId`. | One predictable problem shape for transaction-service. |
+| D35 | New code `INTERNAL_ERROR` (500) for unexpected failures inside ledger-service. `LEDGER_ERROR` stays for unexpected ledger results. Spring MVC's own errors keep their status and get `VALIDATION_FAILED` (4xx, including 404/405/415) or `INTERNAL_ERROR` (5xx). | Every error body has a machine-readable `code`. |
+| D36 | Logging: the 503s (`OVERLOADED`, `LEDGER_TIMEOUT`) at warn without a stack trace, `LEDGER_ERROR` at error, unexpected 5xx at error with a stack trace, 4xx at debug. One info line per posting outcome. | Load shedding must not flood the log during the overload it signals. The fence counter and the error-level lines are the alert signals. |
+| D37 | Metrics: `ledger_posting_duration{outcome=POSTED\|REJECTED\|UNKNOWN\|ERROR}`, `ledger_tb_request{operation,result}`, `ledger_client_fence` (Prometheus adds `_seconds` / `_total`). Percentile histograms are enabled for p95/p99. | Spec §12 metrics that belong to this service. |
+| D38 | `PostingService` is a non-final class with non-final public methods. | `@ConcurrencyLimit` is applied by a CGLIB proxy. |
+| D40 | The `ledger-service` container runs with `seccomp=unconfined`, and every JVM gets `--enable-native-access=ALL-UNNAMED`. | Found in the compose smoke test: on Linux the TigerBeetle Java client uses io_uring. The default seccomp profile makes the native client panic, which kills the JVM. The flag silences the JDK 25 JNI warning. |
+| D41 | `server.mime-mappings.yaml=application/yaml`, so `GET /openapi.yaml` is served as `application/yaml`. | Without it Tomcat serves `application/octet-stream`. |
+| D39 | Verified against real TigerBeetle 0.17.9 (integration test): an identical replay returns `Exists` on every leg, giving POSTED `replay:true` with the original timestamp. A retry of a posting rejected for insufficient funds returns `IdAlreadyFailed`, giving 422 `PREVIOUSLY_REJECTED` (confirms D9). | Evidence for D7–D9. |

@@ -1,4 +1,4 @@
-package com.bracits.ledgerservice.application.posting;
+package com.bracits.ledgerservice.application.posting.service.impl;
 
 import static com.bracits.ledgerservice.api.support.ApiFixtures.POSTING_ID;
 import static com.bracits.ledgerservice.api.support.ApiFixtures.RECEIVER;
@@ -7,29 +7,34 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.bracits.ledgerservice.api.support.FakeLedgerStore;
-import com.bracits.ledgerservice.application.ApplicationConstants;
-import com.bracits.ledgerservice.config.PostingProperties;
-import com.bracits.ledgerservice.domain.DomainValidationException;
-import com.bracits.ledgerservice.domain.posting.Leg;
-import com.bracits.ledgerservice.domain.posting.Posting;
-import com.bracits.ledgerservice.domain.posting.PostingOutcome;
-import com.bracits.ledgerservice.domain.posting.RejectionCode;
+import com.bracits.ledgerservice.application.constant.ApplicationConstants;
+import com.bracits.ledgerservice.application.posting.enums.PostingMetricOutcome;
+import com.bracits.ledgerservice.application.posting.metrics.impl.PostingOutcomeRecorderImpl;
+import com.bracits.ledgerservice.config.properties.PostingProperties;
+import com.bracits.ledgerservice.domain.exception.DomainValidationException;
+import com.bracits.ledgerservice.domain.posting.enums.RejectionCode;
+import com.bracits.ledgerservice.domain.posting.model.Leg;
+import com.bracits.ledgerservice.domain.posting.model.Posting;
+import com.bracits.ledgerservice.domain.posting.model.PostingOutcome;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.slf4j.MDC;
 
-class PostingServiceTest {
+class PostingServiceImplTest {
 
   private static final int MAX_LEGS = 4;
 
   private final FakeLedgerStore store = new FakeLedgerStore();
   private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
-  private final PostingService service = new PostingService(store, new PostingProperties(MAX_LEGS, 1), registry);
+  private final PostingServiceImpl service =
+      new PostingServiceImpl(
+          store, new PostingProperties(MAX_LEGS, 1), new PostingOutcomeRecorderImpl(registry));
 
   private static Posting postingWithLegs(int count) {
-    return new Posting(POSTING_ID, 1, 0L, Collections.nCopies(count, new Leg(SENDER, RECEIVER, 1L, 10)));
+    return new Posting(
+        POSTING_ID, 1, 0L, Collections.nCopies(count, new Leg(SENDER, RECEIVER, 1L, 10)));
   }
 
   @Test
@@ -38,13 +43,14 @@ class PostingServiceTest {
 
     PostingOutcome outcome = service.post(postingWithLegs(2));
 
-    assertThat(outcome).isEqualTo(new PostingOutcome.Rejected(RejectionCode.INSUFFICIENT_FUNDS, 1));
+    assertThat(outcome)
+        .isEqualTo(new PostingOutcome.Rejected(RejectionCode.INSUFFICIENT_FUNDS, 1));
     assertThat(
-            registry
-                .get(ApplicationConstants.METRIC_POSTING_DURATION)
-                .tag(ApplicationConstants.TAG_OUTCOME, PostingMetricOutcome.REJECTED.name())
-                .timer()
-                .count())
+        registry
+            .get(ApplicationConstants.METRIC_POSTING_DURATION)
+            .tag(ApplicationConstants.TAG_OUTCOME, PostingMetricOutcome.REJECTED.name())
+            .timer()
+            .count())
         .isEqualTo(1);
   }
 
@@ -65,14 +71,17 @@ class PostingServiceTest {
 
   @Test
   void enforcesConfiguredMaxLegs() {
-    assertThatThrownBy(() -> service.post(postingWithLegs(MAX_LEGS + 1))).isInstanceOf(DomainValidationException.class);
+    assertThatThrownBy(() -> service.post(postingWithLegs(MAX_LEGS + 1)))
+        .isInstanceOf(DomainValidationException.class);
     assertThat(store.postings()).isEmpty();
   }
 
   @Test
   void lookupLegsWithinConfiguredRange() {
-    assertThatThrownBy(() -> service.lookup(POSTING_ID, 0)).isInstanceOf(DomainValidationException.class);
-    assertThatThrownBy(() -> service.lookup(POSTING_ID, MAX_LEGS + 1)).isInstanceOf(DomainValidationException.class);
+    assertThatThrownBy(() -> service.lookup(POSTING_ID, 0))
+        .isInstanceOf(DomainValidationException.class);
+    assertThatThrownBy(() -> service.lookup(POSTING_ID, MAX_LEGS + 1))
+        .isInstanceOf(DomainValidationException.class);
     assertThat(service.lookup(POSTING_ID, MAX_LEGS).isPosted()).isFalse();
   }
 }

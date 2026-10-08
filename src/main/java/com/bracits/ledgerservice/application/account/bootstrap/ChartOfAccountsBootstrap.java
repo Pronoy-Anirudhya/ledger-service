@@ -1,11 +1,12 @@
-package com.bracits.ledgerservice.application.account;
+package com.bracits.ledgerservice.application.account.bootstrap;
 
-import com.bracits.ledgerservice.config.AccountsProperties;
-import com.bracits.ledgerservice.config.ConfigConstants;
-import com.bracits.ledgerservice.domain.account.AccountCreation;
-import com.bracits.ledgerservice.domain.account.SystemAccount;
+import com.bracits.ledgerservice.application.constant.ApplicationConstants;
+import com.bracits.ledgerservice.config.constant.ConfigConstants;
+import com.bracits.ledgerservice.config.properties.AccountsProperties;
+import com.bracits.ledgerservice.domain.account.enums.SystemAccount;
+import com.bracits.ledgerservice.domain.account.model.AccountCreation;
 import com.bracits.ledgerservice.port.out.LedgerStore;
-import com.bracits.ledgerservice.port.out.LedgerUnavailableException;
+import com.bracits.ledgerservice.port.out.exception.LedgerUnavailableException;
 import java.time.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,17 +21,12 @@ import org.springframework.stereotype.Component;
  * {@code bootstrapRetryInterval} until {@code bootstrapTimeout}, then fails start-up.
  */
 @Component
-@ConditionalOnBooleanProperty(name = ConfigConstants.ACCOUNTS_BOOTSTRAP_PROPERTY, matchIfMissing = true)
+@ConditionalOnBooleanProperty(
+    name = ConfigConstants.ACCOUNTS_BOOTSTRAP_PROPERTY,
+    matchIfMissing = true)
 public final class ChartOfAccountsBootstrap implements ApplicationRunner {
 
-  private static final Logger log = LoggerFactory.getLogger(ChartOfAccountsBootstrap.class);
-
-  private static final String LOG_ACCOUNT_READY = "System account {} ({}): {}";
-  private static final String LOG_RETRY = "Ledger unavailable while creating system account {}; retrying in {}";
-  private static final String MSG_CONFLICT =
-      "System account %s (%s) already exists with different fields";
-  private static final String MSG_TIMEOUT = "Ledger unavailable for %s while creating system account %s";
-  private static final String MSG_INTERRUPTED = "Interrupted while creating system account %s";
+  private static final Logger LOG = LoggerFactory.getLogger(ChartOfAccountsBootstrap.class);
 
   private final LedgerStore ledgerStore;
   private final Duration timeout;
@@ -45,6 +41,7 @@ public final class ChartOfAccountsBootstrap implements ApplicationRunner {
   @Override
   public void run(ApplicationArguments args) {
     long deadline = System.nanoTime() + timeout.toNanos();
+
     for (SystemAccount systemAccount : SystemAccount.values()) {
       create(systemAccount, deadline);
     }
@@ -54,19 +51,27 @@ public final class ChartOfAccountsBootstrap implements ApplicationRunner {
     while (true) {
       try {
         AccountCreation creation = ledgerStore.createAccount(systemAccount.toAccount());
+
         switch (creation.status()) {
-          case CREATED, EXISTS ->
-              log.info(LOG_ACCOUNT_READY, systemAccount, systemAccount.id(), creation.status());
-          case CONFLICT ->
-              throw new IllegalStateException(
-                  MSG_CONFLICT.formatted(systemAccount, systemAccount.id()));
+          case CREATED, EXISTS -> LOG.info(
+              ApplicationConstants.LOG_SYSTEM_ACCOUNT_READY,
+              systemAccount,
+              systemAccount.id(),
+              creation.status());
+          case CONFLICT -> throw new IllegalStateException(
+              ApplicationConstants.MSG_SYSTEM_ACCOUNT_CONFLICT.formatted(
+                  systemAccount, systemAccount.id()));
         }
+
         return;
       } catch (LedgerUnavailableException e) {
         if (System.nanoTime() - deadline >= 0) {
-          throw new IllegalStateException(MSG_TIMEOUT.formatted(timeout, systemAccount), e);
+          throw new IllegalStateException(
+              ApplicationConstants.MSG_SYSTEM_ACCOUNT_TIMEOUT.formatted(timeout, systemAccount),
+              e);
         }
-        log.warn(LOG_RETRY, systemAccount, retryInterval);
+
+        LOG.warn(ApplicationConstants.LOG_SYSTEM_ACCOUNT_RETRY, systemAccount, retryInterval);
         pause(systemAccount);
       }
     }
@@ -77,7 +82,8 @@ public final class ChartOfAccountsBootstrap implements ApplicationRunner {
       Thread.sleep(retryInterval);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      throw new IllegalStateException(MSG_INTERRUPTED.formatted(systemAccount), e);
+      throw new IllegalStateException(
+          ApplicationConstants.MSG_SYSTEM_ACCOUNT_INTERRUPTED.formatted(systemAccount), e);
     }
   }
 }

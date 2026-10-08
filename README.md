@@ -18,25 +18,31 @@ Spec: [`docs/Send Money POC v2 — SRS & Design Spec.md`](docs/Send%20Money%20PO
 
 ## Project layout
 
-Hexagonal: the domain has no Spring or TigerBeetle types; the API and the TigerBeetle adapter depend on it, never the other way round.
+Hexagonal: the domain has no Spring or TigerBeetle types; the API and the TigerBeetle adapter depend on it, never the other way round. Each feature package is split by kind of class (`controller`, `dto`, `mapper`, `service`, `model`, `enums`, `constant`, `exception`, ...), so a package only holds what its name says. Every injected collaborator (service, client, mapper, metrics, logger) is a contract interface; its implementation lives in an `impl/` sub-package as `<Name>Impl`, and consumers depend only on the interface.
 
 ```
 src/main/java/com/bracits/ledgerservice/
-  api/                      HTTP layer: ApiConstants
-    account/                accounts + balance controller, request/response records, mapper
-    posting/                postings + lookup controller, records, mapper
-    funding/                fundings controller (profile "test")
-    error/                  ErrorCode, RFC 9457 ProblemDetail mapping and advice
+  api/
+    constant/                     ApiConstants
+    posting/  controller/ dto/ mapper/     postings + lookup (PostingApiMapper, PostingOutcomeResponseMapper)
+    account/  controller/ dto/ mapper/     accounts + balance
+    funding/  controller/ dto/ mapper/     fundings (profile "test")
+    error/    advice/ dto/ enums/ mapper/ logging/   RFC 9457 problems: ProblemDetailAdvice, ErrorCode, mappers, RequestFailureLogger
   application/
-    posting/                PostingService (@ConcurrencyLimit, MDC postingId, timer)
-    account/                AccountService, ChartOfAccountsBootstrap
+    constant/                     ApplicationConstants
+    posting/  service/ metrics/ enums/     PostingService (@ConcurrencyLimit, MDC), PostingOutcomeRecorder (timers + outcome log)
+    account/  service/ bootstrap/          AccountService, ChartOfAccountsBootstrap
   domain/
-    posting/                Posting, Leg, PostingOutcome, RejectionCode, TransferIds, ...
-    account/                Account, AccountFlag, Balance, SystemAccount, ...
-  port/out/                 LedgerStore (the port to the ledger), LedgerUnavailableException
-  adapter/out/tigerbeetle/  FencedClientHolder, TigerBeetleLedgerStore, mappers, health indicator
-  config/                   @ConfigurationProperties records, ResilienceConfig
-openapi/ledger-api.yaml     authoritative contract, served at GET /openapi.yaml
+    constant/ exception/ validation/       DomainConstants, DomainValidationException, DomainIds
+    posting/  model/ enums/ factory/       Posting, Leg, PostingOutcome, PostingStatus, RejectionCode, TransferIds
+    account/  model/ enums/                Account, Balance, AccountFlag, SystemAccount, ...
+  port/out/                       LedgerStore; exception/ LedgerUnavailableException, LedgerErrorException
+  adapter/out/tigerbeetle/
+    client/ metrics/ enums/       FencedClientHolder, TigerBeetleClientFactory, TigerBeetleRequestMetrics, TigerBeetleOperation
+    store/ mapper/ model/         TigerBeetleLedgerStore, batch/id/result mappers, LegResult, LegLookup, ChainResult
+    health/ constant/             TigerBeetleHealthIndicator, TigerBeetleConstants
+  config/                         ResilienceConfig; constant/ ConfigConstants; properties/ @ConfigurationProperties records
+openapi/ledger-api.yaml           authoritative contract, served at GET /openapi.yaml
 ```
 
 ## Build and test

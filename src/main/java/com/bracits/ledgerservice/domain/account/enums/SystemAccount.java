@@ -1,6 +1,7 @@
-package com.bracits.ledgerservice.domain.account;
+package com.bracits.ledgerservice.domain.account.enums;
 
-import com.bracits.ledgerservice.domain.DomainConstants;
+import com.bracits.ledgerservice.domain.account.model.Account;
+import com.bracits.ledgerservice.domain.constant.DomainConstants;
 import java.util.Set;
 import java.util.UUID;
 
@@ -28,7 +29,9 @@ public enum SystemAccount {
     return new UUID(0L, code);
   }
 
-  /** The account to create at start-up (no flags, {@code user_data_64} = 0). */
+  /**
+   * The account to create at start-up (no flags, {@code user_data_64} = 0).
+   */
   public Account toAccount() {
     return new Account(id(), code, Set.of(), DomainConstants.SYSTEM_ACCOUNT_USER_DATA_64);
   }

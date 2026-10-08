@@ -1,11 +1,13 @@
-package com.bracits.ledgerservice.domain.posting;
+package com.bracits.ledgerservice.domain.posting.factory;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.bracits.ledgerservice.domain.DomainConstants;
-import com.bracits.ledgerservice.domain.DomainValidationException;
+import com.bracits.ledgerservice.domain.constant.DomainConstants;
+import com.bracits.ledgerservice.domain.exception.DomainValidationException;
+import com.bracits.ledgerservice.domain.posting.model.Leg;
+import com.bracits.ledgerservice.domain.posting.model.Posting;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -17,7 +19,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 class TransferIdsTest {
 
   private static final UUID POSTING_ID = UUID.fromString("0192f5a4-1234-7abc-8def-0123456789ab");
-  private static final UUID FREE_POSTING_ID = UUID.fromString("0192f5a4-1234-7abc-8def-012345678900");
+  private static final UUID FREE_POSTING_ID =
+      UUID.fromString("0192f5a4-1234-7abc-8def-012345678900");
   private static final UUID A = new UUID(0L, 1001L);
   private static final UUID B = new UUID(0L, 1002L);
 
@@ -26,10 +29,12 @@ class TransferIdsTest {
   void legIdSetsTheLowByteToTheLegIndex(int legIndex) {
     UUID legId = TransferIds.legId(FREE_POSTING_ID, legIndex);
 
-    assertThat(legId.getMostSignificantBits()).isEqualTo(FREE_POSTING_ID.getMostSignificantBits());
+    assertThat(legId.getMostSignificantBits())
+        .isEqualTo(FREE_POSTING_ID.getMostSignificantBits());
     assertThat(legId.getLeastSignificantBits())
         .isEqualTo(FREE_POSTING_ID.getLeastSignificantBits() | legIndex);
-    assertThat(legId.getLeastSignificantBits() & DomainConstants.LEG_INDEX_MASK).isEqualTo(legIndex);
+    assertThat(legId.getLeastSignificantBits() & DomainConstants.LEG_INDEX_MASK)
+        .isEqualTo(legIndex);
   }
 
   @Test
@@ -46,8 +51,10 @@ class TransferIdsTest {
     for (int n = 1; n <= DomainConstants.MAX_LEGS; n++) {
       ids.add(TransferIds.legId(FREE_POSTING_ID, n));
     }
+
     assertThat(ids).doesNotHaveDuplicates().doesNotContain(FREE_POSTING_ID);
-    assertThat(TransferIds.legId(FREE_POSTING_ID, 3)).isEqualTo(TransferIds.legId(FREE_POSTING_ID, 3));
+    assertThat(TransferIds.legId(FREE_POSTING_ID, 3))
+        .isEqualTo(TransferIds.legId(FREE_POSTING_ID, 3));
   }
 
   @ParameterizedTest
@@ -90,14 +97,23 @@ class TransferIdsTest {
     assertThatThrownBy(() -> new Posting(FREE_POSTING_ID, 1, 0L, null))
         .isInstanceOf(DomainValidationException.class);
     assertThatThrownBy(
-            () -> new Posting(FREE_POSTING_ID, 1, 0L, Collections.nCopies(DomainConstants.MAX_LEGS + 1, leg())))
+        () ->
+            new Posting(
+                FREE_POSTING_ID,
+                1,
+                0L,
+                Collections.nCopies(DomainConstants.MAX_LEGS + 1, leg())))
         .isInstanceOf(DomainValidationException.class);
   }
 
   @Test
   void postingAcceptsOneToMaxLegs() {
-    assertThatCode(() -> new Posting(FREE_POSTING_ID, 1, 0L, List.of(leg()))).doesNotThrowAnyException();
-    Posting max = new Posting(FREE_POSTING_ID, 1, 0L, Collections.nCopies(DomainConstants.MAX_LEGS, leg()));
+    assertThatCode(() -> new Posting(FREE_POSTING_ID, 1, 0L, List.of(leg())))
+        .doesNotThrowAnyException();
+
+    Posting max =
+        new Posting(FREE_POSTING_ID, 1, 0L, Collections.nCopies(DomainConstants.MAX_LEGS, leg()));
+
     assertThat(max.legCount()).isEqualTo(DomainConstants.MAX_LEGS);
   }
 
@@ -107,24 +123,28 @@ class TransferIdsTest {
         .isInstanceOf(DomainValidationException.class);
     assertThatThrownBy(() -> new Leg(A, DomainConstants.ZERO_ID, 1L, 10))
         .isInstanceOf(DomainValidationException.class);
-    assertThatThrownBy(() -> new Leg(null, B, 1L, 10)).isInstanceOf(DomainValidationException.class);
+    assertThatThrownBy(() -> new Leg(null, B, 1L, 10))
+        .isInstanceOf(DomainValidationException.class);
   }
 
   @ParameterizedTest
   @ValueSource(longs = {0L, -1L, Long.MIN_VALUE})
   void legRejectsNonPositiveAmount(long amount) {
-    assertThatThrownBy(() -> new Leg(A, B, amount, 10)).isInstanceOf(DomainValidationException.class);
+    assertThatThrownBy(() -> new Leg(A, B, amount, 10))
+        .isInstanceOf(DomainValidationException.class);
   }
 
   @ParameterizedTest
   @ValueSource(ints = {0, -1, 65_536})
   void legRejectsInvalidCode(int code) {
-    assertThatThrownBy(() -> new Leg(A, B, 1L, code)).isInstanceOf(DomainValidationException.class);
+    assertThatThrownBy(() -> new Leg(A, B, 1L, code))
+        .isInstanceOf(DomainValidationException.class);
   }
 
   @Test
   void legRejectsSameAccount() {
-    assertThatThrownBy(() -> new Leg(A, A, 1L, 10)).isInstanceOf(DomainValidationException.class);
+    assertThatThrownBy(() -> new Leg(A, A, 1L, 10))
+        .isInstanceOf(DomainValidationException.class);
   }
 
   private static Leg leg() {

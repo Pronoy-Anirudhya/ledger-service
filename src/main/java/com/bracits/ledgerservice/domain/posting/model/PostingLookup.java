@@ -1,12 +1,14 @@
-package com.bracits.ledgerservice.domain.posting;
+package com.bracits.ledgerservice.domain.posting.model;
 
+import com.bracits.ledgerservice.domain.posting.enums.PostingStatus;
 import java.util.UUID;
 
 /**
  * Result of looking up a posting's legs.
  *
- * @param postingId the posting
- * @param status {@link PostingStatus#POSTED} if every leg exists, otherwise {@link PostingStatus#NOT_FOUND}
+ * @param postingId       the posting
+ * @param status          {@link PostingStatus#POSTED} if every leg exists, otherwise
+ *                        {@link PostingStatus#NOT_FOUND}
  * @param ledgerTimestamp timestamp (ns) of the last leg when posted; 0 otherwise
  */
 public record PostingLookup(UUID postingId, PostingStatus status, long ledgerTimestamp) {

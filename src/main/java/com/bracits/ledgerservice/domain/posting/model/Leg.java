@@ -1,17 +1,17 @@
-package com.bracits.ledgerservice.domain.posting;
+package com.bracits.ledgerservice.domain.posting.model;
 
-import com.bracits.ledgerservice.domain.DomainConstants;
-import com.bracits.ledgerservice.domain.DomainIds;
-import com.bracits.ledgerservice.domain.DomainValidationException;
+import com.bracits.ledgerservice.domain.constant.DomainConstants;
+import com.bracits.ledgerservice.domain.exception.DomainValidationException;
+import com.bracits.ledgerservice.domain.validation.DomainIds;
 import java.util.UUID;
 
 /**
  * One leg of a posting: move {@code amount} minor units from the debit to the credit account.
  *
- * @param debitAccountId account debited (non-zero)
+ * @param debitAccountId  account debited (non-zero)
  * @param creditAccountId account credited (non-zero, different from the debit account)
- * @param amount minor units, &gt; 0
- * @param code transfer code, 1..65535 (e.g. 10 principal, 11 fee)
+ * @param amount          minor units, &gt; 0
+ * @param code            transfer code, 1..65535 (e.g. 10 principal, 11 fee)
  */
 public record Leg(UUID debitAccountId, UUID creditAccountId, long amount, int code) {
 

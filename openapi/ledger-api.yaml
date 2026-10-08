@@ -1,0 +1,929 @@
+openapi: 3.1.0
+info:
+  title: ledger-service internal API
+  version: 1.0.0
+  summary: TigerBeetle-backed, product-agnostic double-entry ledger.
+  description: |
+    Authoritative contract of `ledger-service` (Send Money POC v2, spec section 7.2). The ledger is
+    generic: it knows accounts, multi-leg postings and transfer codes, nothing about Send Money.
+
+    **Internal only.** The service is reachable only on the internal network. It has no
+    authentication and must never be exposed through a public gateway.
+
+    **Identifiers.** Account, posting and funding ids are 128-bit values written as UUID strings.
+    The UUID's most significant 64 bits are the high half of the TigerBeetle id, so
+    `00000000-0000-0000-0000-0000000000c8` is account 200 (fee income). The low byte of a
+    `postingId` (and `fundingId`) must be `00`: it is reserved for the 1-based leg index.
+
+    **Idempotency through deterministic transfer ids.** Leg *n* (n = 1..8) of a posting is written
+    as transfer id `postingId | n`. Every retry, from any instance, at any time, sends identical ids,
+    so a posting is applied at most once. Re-sending a posting that already committed returns
+    `200 POSTED` with `replay: true` and the original timestamp.
+
+    **Retry rules.**
+    - Retry **only** on `503` (`LEDGER_TIMEOUT` or `OVERLOADED`), I/O errors and read timeouts,
+      honouring `Retry-After`, and **always with the identical body** (same `postingId`, same legs).
+    - **Never retry `409` or `422`.** A `422` is definitive: nothing was posted and nothing ever will
+      be under that `postingId`.
+    - A `500` is a bug: alert and leave the posting in doubt; resolve it later by re-sending the
+      identical posting or by `GET /internal/v1/postings/{postingId}?legs=n`.
+
+    **Commit point.** `200 POSTED` is returned only after TigerBeetle has durably replicated and
+    applied the whole linked chain. It is the commit point: the money has moved and cannot be lost.
+    A `503` means the outcome is unknown (`postingStatus: UNKNOWN`), never that it failed.
+
+    **Errors** are RFC 9457 Problem Details (`application/problem+json`) with a machine-readable
+    `code` extension member and `type` = `urn:problem:ledger:<code>`.
+servers:
+  - url: http://ledger-service:8081
+    description: Internal network (Docker Compose / cluster service name)
+  - url: http://localhost:8081
+    description: Local development
+tags:
+  - name: accounts
+    description: Ledger accounts and balances.
+  - name: postings
+    description: Atomic multi-leg postings and their lookup.
+  - name: fundings
+    description: Test-profile only. Cash-in from the e-money issuance account.
+  - name: operations
+    description: Health probes, metrics and this contract.
+
+paths:
+  /internal/v1/accounts:
+    post:
+      tags: [accounts]
+      operationId: createAccount
+      summary: Create an account (idempotent)
+      description: |
+        Creates a ledger account on ledger 1. Re-sending an identical request returns `200 EXISTS`.
+        An account that already exists with a different `code`, `flags` or `userData64` returns
+        `409 ACCOUNT_CONFLICT`. The fixed system accounts (200, 210, 220, 900) are created by the
+        service at start-up.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccountRequest'
+            examples:
+              customerWallet:
+                summary: Customer wallet (cannot be overdrawn)
+                value:
+                  accountId: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                  code: 100
+                  flags: [DEBITS_MUST_NOT_EXCEED_CREDITS]
+                  userData64: 42
+              minimal:
+                summary: Only the required fields (no flags, userData64 = 0)
+                value:
+                  accountId: 0192f0b1-4d5e-7f60-9b1c-2d3e4f5a6b22
+                  code: 100
+      responses:
+        '201':
+          description: The account was created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+              examples:
+                created:
+                  value:
+                    accountId: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                    status: CREATED
+        '200':
+          description: The account already exists with identical fields (idempotent retry).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountResponse'
+              examples:
+                exists:
+                  value:
+                    accountId: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                    status: EXISTS
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '409':
+          description: The account already exists with different fields. Do not retry.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                accountConflict:
+                  value:
+                    type: urn:problem:ledger:ACCOUNT_CONFLICT
+                    title: Account conflict
+                    status: 409
+                    detail: Account 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11 already exists with different fields
+                    instance: /internal/v1/accounts
+                    code: ACCOUNT_CONFLICT
+                    accountId: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/LedgerUnavailable'
+
+  /internal/v1/accounts/{accountId}/balance:
+    get:
+      tags: [accounts]
+      operationId: getAccountBalance
+      summary: Read an account's balance
+      description: |
+        Reads the balance straight from TigerBeetle. All amounts are minor units (poisha).
+        `available = creditsPosted - debitsPosted - debitsPending` (credit-normal), so it is negative
+        for debit-normal accounts such as the e-money issuance account.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+      responses:
+        '200':
+          description: The balance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceResponse'
+              examples:
+                customerWallet:
+                  summary: Sender wallet after funding 500000 and one Send Money
+                  value:
+                    accountId: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                    debitsPosted: 100500
+                    creditsPosted: 500000
+                    debitsPending: 0
+                    creditsPending: 0
+                    available: 399500
+                issuance:
+                  summary: E-money issuance account (negative available)
+                  value:
+                    accountId: 00000000-0000-0000-0000-000000000384
+                    debitsPosted: 500000
+                    creditsPosted: 0
+                    debitsPending: 0
+                    creditsPending: 0
+                    available: -500000
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '404':
+          description: No account with this id.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetail'
+              examples:
+                accountNotFound:
+                  value:
+                    type: urn:problem:ledger:ACCOUNT_NOT_FOUND
+                    title: Account not found
+                    status: 404
+                    detail: Account 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a99 does not exist
+                    instance: /internal/v1/accounts/0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a99/balance
+                    code: ACCOUNT_NOT_FOUND
+                    accountId: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a99
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/LedgerUnavailable'
+
+  /internal/v1/postings:
+    post:
+      tags: [postings]
+      operationId: createPosting
+      summary: Atomic multi-leg posting (idempotent)
+      description: |
+        Posts 1..8 legs as one linked TigerBeetle chain: all legs are applied or none is. Leg *n* is
+        transfer id `postingId | n`, with `user_data_128 = postingId`, `user_data_64 = userData64`
+        and `user_data_32 = product`.
+
+        Validation (400 `VALIDATION_FAILED`): 1..8 legs; every amount > 0; every code 1..65535;
+        the low byte of `postingId` is 0; every account id is non-zero; debit and credit of a leg
+        differ.
+
+        | Response | Meaning | Caller action |
+        | --- | --- | --- |
+        | 200 POSTED, `replay: false` | All legs created now | Commit |
+        | 200 POSTED, `replay: true` | Already committed by an earlier attempt | Commit |
+        | 422 `INSUFFICIENT_FUNDS` / `ACCOUNT_NOT_FOUND` / `PREVIOUSLY_REJECTED` | Nothing posted, definitively | Fail; never retry |
+        | 409 `POSTING_CONFLICT` | Same id, different content (caller bug) | Alert; never retry |
+        | 500 `LEDGER_ERROR` | Unexpected ledger result (bug) | Alert; resolve later |
+        | 503 `LEDGER_TIMEOUT` / `OVERLOADED` | Outcome unknown / not attempted | Retry the identical body |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostingRequest'
+            examples:
+              sendMoney:
+                summary: Send Money, 4 linked legs (principal, fee, VAT, commission)
+                value:
+                  postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                  product: 1
+                  userData64: 42
+                  legs:
+                    - debit: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                      credit: 0192f0b1-4d5e-7f60-9b1c-2d3e4f5a6b22
+                      amount: 100000
+                      code: 10
+                    - debit: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                      credit: 00000000-0000-0000-0000-0000000000c8
+                      amount: 348
+                      code: 11
+                    - debit: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                      credit: 00000000-0000-0000-0000-0000000000d2
+                      amount: 65
+                      code: 12
+                    - debit: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                      credit: 00000000-0000-0000-0000-0000000000dc
+                      amount: 87
+                      code: 13
+      responses:
+        '200':
+          description: |
+            POSTED. TigerBeetle has durably applied every leg. This is the commit point.
+            `timestamp` is the TigerBeetle timestamp (ns) of the last leg; on a replay it is the
+            original posting's timestamp.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostingResponse'
+              examples:
+                posted:
+                  summary: First attempt
+                  value:
+                    postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                    status: POSTED
+                    replay: false
+                    timestamp: 1791350858928000000
+                replay:
+                  summary: Identical retry of an already committed posting
+                  value:
+                    postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                    status: POSTED
+                    replay: true
+                    timestamp: 1791350858928000000
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '409':
+          $ref: '#/components/responses/PostingConflict'
+        '422':
+          $ref: '#/components/responses/PostingRejected'
+        '500':
+          $ref: '#/components/responses/PostingLedgerError'
+        '503':
+          $ref: '#/components/responses/PostingUnavailable'
+
+  /internal/v1/postings/{postingId}:
+    get:
+      tags: [postings]
+      operationId: getPosting
+      summary: Look up whether a posting committed
+      description: |
+        Looks up the leg transfers `postingId | 1` .. `postingId | legs`. A linked chain is
+        all-or-nothing, so the posting is `POSTED` (with the last leg's timestamp) only when all
+        `legs` transfers exist; otherwise it is `NOT_FOUND` (no `timestamp`). `NOT_FOUND` does not
+        prevent a later commit of an in-flight posting; re-sending the identical posting is the
+        definitive probe.
+      parameters:
+        - name: postingId
+          in: path
+          required: true
+          description: The posting id (low byte 00).
+          schema:
+            type: string
+            format: uuid
+          example: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+        - name: legs
+          in: query
+          required: true
+          description: Number of legs the posting was sent with.
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 8
+          example: 4
+      responses:
+        '200':
+          description: The lookup result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostingLookupResponse'
+              examples:
+                posted:
+                  value:
+                    postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                    status: POSTED
+                    timestamp: 1791350858928000000
+                notFound:
+                  value:
+                    postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                    status: NOT_FOUND
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/LedgerUnavailable'
+
+  /internal/v1/fundings:
+    post:
+      tags: [fundings]
+      operationId: createFunding
+      summary: Fund an account from e-money issuance (test profile only)
+      description: |
+        Available **only when the Spring profile `test` is active**; otherwise the path does not
+        exist (404). Posts a single transfer from the e-money issuance account
+        (`00000000-0000-0000-0000-000000000384`, code 900) to `accountId` with transfer code 1 and
+        product 0, through the same posting path, so idempotency, retry rules and responses are those
+        of `POST /internal/v1/postings`. The transfer id is `fundingId | 1`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FundingRequest'
+            examples:
+              fundWallet:
+                value:
+                  fundingId: 0192f5a3-1b4d-7e2f-8a6c-3d9e0f1a2b00
+                  accountId: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+                  amount: 500000
+      responses:
+        '200':
+          description: POSTED. The account was credited (or the funding was already applied).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PostingResponse'
+              examples:
+                posted:
+                  value:
+                    postingId: 0192f5a3-1b4d-7e2f-8a6c-3d9e0f1a2b00
+                    status: POSTED
+                    replay: false
+                    timestamp: 1791350857104000000
+        '400':
+          $ref: '#/components/responses/ValidationFailed'
+        '409':
+          $ref: '#/components/responses/PostingConflict'
+        '422':
+          $ref: '#/components/responses/PostingRejected'
+        '500':
+          $ref: '#/components/responses/PostingLedgerError'
+        '503':
+          $ref: '#/components/responses/PostingUnavailable'
+
+  /actuator/health/liveness:
+    get:
+      tags: [operations]
+      operationId: getLiveness
+      summary: Liveness probe
+      description: The JVM is running. Does not depend on TigerBeetle.
+      responses:
+        '200':
+          $ref: '#/components/responses/HealthUp'
+        '503':
+          $ref: '#/components/responses/HealthDown'
+
+  /actuator/health/readiness:
+    get:
+      tags: [operations]
+      operationId: getReadiness
+      summary: Readiness probe
+      description: |
+        Ready to take traffic: the application has started and TigerBeetle is reachable (the
+        e-money issuance account is looked up within the ledger deadline).
+      responses:
+        '200':
+          $ref: '#/components/responses/HealthUp'
+        '503':
+          $ref: '#/components/responses/HealthDown'
+
+  /actuator/prometheus:
+    get:
+      tags: [operations]
+      operationId: getPrometheusMetrics
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Metrics in the Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                # HELP ledger_client_fence_total Number of TigerBeetle client fences
+                # TYPE ledger_client_fence_total counter
+                ledger_client_fence_total 0.0
+
+  /openapi.yaml:
+    get:
+      tags: [operations]
+      operationId: getOpenApiContract
+      summary: This contract
+      responses:
+        '200':
+          description: The OpenAPI 3.1 document, as authored in `openapi/ledger-api.yaml`.
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+components:
+  parameters:
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      description: The account id.
+      schema:
+        type: string
+        format: uuid
+      example: 0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11
+
+  headers:
+    RetryAfter:
+      description: Seconds to wait before retrying the identical request.
+      required: true
+      schema:
+        type: integer
+        const: 1
+      example: 1
+
+  responses:
+    ValidationFailed:
+      description: |
+        `VALIDATION_FAILED`: the body, a path variable or a query parameter is invalid. `errors`
+        lists the offending fields when known. Do not retry.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            amountNotPositive:
+              value:
+                type: urn:problem:ledger:VALIDATION_FAILED
+                title: Invalid request
+                status: 400
+                detail: Request validation failed
+                instance: /internal/v1/postings
+                code: VALIDATION_FAILED
+                errors:
+                  - field: legs[0].amount
+                    message: must be greater than 0
+            postingIdLowByte:
+              value:
+                type: urn:problem:ledger:VALIDATION_FAILED
+                title: Invalid request
+                status: 400
+                detail: the low byte of postingId must be 0
+                instance: /internal/v1/postings
+                code: VALIDATION_FAILED
+                errors:
+                  - field: postingId
+                    message: the low byte of postingId must be 0
+
+    PostingConflict:
+      description: |
+        `POSTING_CONFLICT`: a transfer with one of this posting's ids already exists with different
+        content. This is a caller bug. Do not retry; alert.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            postingConflict:
+              value:
+                type: urn:problem:ledger:POSTING_CONFLICT
+                title: Posting conflict
+                status: 409
+                detail: Posting 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00 already exists with different content
+                instance: /internal/v1/postings
+                code: POSTING_CONFLICT
+                postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                legIndex: 1
+
+    PostingRejected:
+      description: |
+        REJECTED (`postingStatus: REJECTED`): nothing was posted, definitively. `legIndex` (1-based)
+        names the root-cause leg when known. Never retry.
+        - `INSUFFICIENT_FUNDS`: the debit account's available balance is too low.
+        - `ACCOUNT_NOT_FOUND`: a debit or credit account does not exist.
+        - `PREVIOUSLY_REJECTED`: an earlier attempt with this `postingId` was rejected, so TigerBeetle
+          has permanently failed these ids; the posting can never succeed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            insufficientFunds:
+              value:
+                type: urn:problem:ledger:INSUFFICIENT_FUNDS
+                title: Insufficient funds
+                status: 422
+                detail: Leg 1 exceeds the debit account's available balance
+                instance: /internal/v1/postings
+                code: INSUFFICIENT_FUNDS
+                postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                postingStatus: REJECTED
+                legIndex: 1
+            accountNotFound:
+              value:
+                type: urn:problem:ledger:ACCOUNT_NOT_FOUND
+                title: Account not found
+                status: 422
+                detail: Leg 1 refers to an account that does not exist
+                instance: /internal/v1/postings
+                code: ACCOUNT_NOT_FOUND
+                postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                postingStatus: REJECTED
+                legIndex: 1
+            previouslyRejected:
+              value:
+                type: urn:problem:ledger:PREVIOUSLY_REJECTED
+                title: Posting previously rejected
+                status: 422
+                detail: Posting 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00 was rejected by an earlier attempt
+                instance: /internal/v1/postings
+                code: PREVIOUSLY_REJECTED
+                postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                postingStatus: REJECTED
+                legIndex: 1
+
+    PostingLedgerError:
+      description: |
+        `LEDGER_ERROR` (TigerBeetle returned an unexpected result) or `INTERNAL_ERROR` (unexpected
+        failure inside ledger-service). This is a bug. Alert and leave the posting in doubt; resolve
+        it later by re-sending the identical posting or with the lookup.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            ledgerError:
+              value:
+                type: urn:problem:ledger:LEDGER_ERROR
+                title: Ledger error
+                status: 500
+                detail: Unexpected ledger result for posting 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                instance: /internal/v1/postings
+                code: LEDGER_ERROR
+                postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+
+    PostingUnavailable:
+      description: |
+        The ledger could not be reached in time, or the instance is saturated. Retry the
+        **identical** request after `Retry-After` seconds; any instance may take the retry.
+        - `LEDGER_TIMEOUT` (`postingStatus: UNKNOWN`): the TigerBeetle call timed out or failed and
+          the client was fenced. The posting either committed already (a retry returns
+          `replay: true`) or never will be applied by that attempt.
+        - `OVERLOADED`: the concurrency limit rejected the request before it reached the ledger.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            ledgerTimeout:
+              value:
+                type: urn:problem:ledger:LEDGER_TIMEOUT
+                title: Ledger unavailable
+                status: 503
+                detail: The ledger did not answer within the deadline; the outcome is unknown
+                instance: /internal/v1/postings
+                code: LEDGER_TIMEOUT
+                postingId: 0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00
+                postingStatus: UNKNOWN
+            overloaded:
+              value:
+                type: urn:problem:ledger:OVERLOADED
+                title: Overloaded
+                status: 503
+                detail: Too many concurrent postings; retry later
+                instance: /internal/v1/postings
+                code: OVERLOADED
+
+    LedgerUnavailable:
+      description: |
+        `LEDGER_TIMEOUT`: TigerBeetle did not answer within the deadline. The operation is safe to
+        retry after `Retry-After` seconds.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            ledgerTimeout:
+              value:
+                type: urn:problem:ledger:LEDGER_TIMEOUT
+                title: Ledger unavailable
+                status: 503
+                detail: The ledger did not answer within the deadline
+                code: LEDGER_TIMEOUT
+
+    InternalError:
+      description: |
+        Unexpected server error: `LEDGER_ERROR` (unexpected ledger result) or `INTERNAL_ERROR`
+        (unexpected failure inside ledger-service). Alert. Clients must accept any `code` for a 500.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            ledgerError:
+              value:
+                type: urn:problem:ledger:LEDGER_ERROR
+                title: Ledger error
+                status: 500
+                detail: Unexpected ledger result
+                code: LEDGER_ERROR
+            internalError:
+              value:
+                type: urn:problem:ledger:INTERNAL_ERROR
+                title: Internal error
+                status: 500
+                detail: Unexpected error
+                code: INTERNAL_ERROR
+
+    HealthUp:
+      description: UP.
+      content:
+        application/vnd.spring-boot.actuator.v3+json:
+          schema:
+            $ref: '#/components/schemas/HealthResponse'
+          example:
+            status: UP
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HealthResponse'
+          example:
+            status: UP
+
+    HealthDown:
+      description: DOWN (or OUT_OF_SERVICE).
+      content:
+        application/vnd.spring-boot.actuator.v3+json:
+          schema:
+            $ref: '#/components/schemas/HealthResponse'
+          example:
+            status: DOWN
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HealthResponse'
+          example:
+            status: DOWN
+
+  schemas:
+    Uuid128:
+      type: string
+      format: uuid
+      description: 128-bit ledger id as a UUID string (MSB = high 64 bits, LSB = low 64 bits).
+      examples: [0192f0b1-2c3d-7e4f-8a5b-6c7d8e9f0a11]
+
+    PostingId:
+      type: string
+      format: uuid
+      description: 128-bit posting id; its low byte must be 00 (reserved for the leg index).
+      pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{10}00$'
+      examples: [0192f5a4-7c2e-7b1a-9d3e-5f4a2b1c0d00]
+
+    TransferCode:
+      type: integer
+      format: int32
+      minimum: 1
+      maximum: 65535
+      description: TigerBeetle `code` (u16, non-zero).
+
+    PostingRequest:
+      type: object
+      required: [postingId, product, userData64, legs]
+      properties:
+        postingId:
+          $ref: '#/components/schemas/PostingId'
+        product:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Written to every leg's `user_data_32` (e.g. 1 = SEND_MONEY).
+          examples: [1]
+        userData64:
+          type: integer
+          format: int64
+          description: Written to every leg's `user_data_64` (e.g. the sender wallet id).
+          examples: [42]
+        legs:
+          type: array
+          minItems: 1
+          maxItems: 8
+          description: Legs in chain order. Leg n (1-based) gets transfer id `postingId | n`.
+          items:
+            $ref: '#/components/schemas/Leg'
+
+    Leg:
+      type: object
+      required: [debit, credit, amount, code]
+      properties:
+        debit:
+          $ref: '#/components/schemas/Uuid128'
+        credit:
+          $ref: '#/components/schemas/Uuid128'
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Minor units (poisha).
+          examples: [100000]
+        code:
+          $ref: '#/components/schemas/TransferCode'
+
+    PostingResponse:
+      type: object
+      required: [postingId, status, replay, timestamp]
+      properties:
+        postingId:
+          $ref: '#/components/schemas/Uuid128'
+        status:
+          type: string
+          const: POSTED
+        replay:
+          type: boolean
+          description: True if the posting had already been committed by an earlier attempt.
+        timestamp:
+          type: integer
+          format: int64
+          description: TigerBeetle timestamp (ns since the Unix epoch) of the last leg.
+          examples: [1791350858928000000]
+
+    PostingLookupResponse:
+      type: object
+      required: [postingId, status]
+      properties:
+        postingId:
+          $ref: '#/components/schemas/Uuid128'
+        status:
+          type: string
+          enum: [POSTED, NOT_FOUND]
+        timestamp:
+          type: integer
+          format: int64
+          description: TigerBeetle timestamp (ns) of the last leg. Present only when POSTED.
+          examples: [1791350858928000000]
+
+    AccountFlag:
+      type: string
+      enum: [DEBITS_MUST_NOT_EXCEED_CREDITS, CREDITS_MUST_NOT_EXCEED_DEBITS, HISTORY]
+
+    CreateAccountRequest:
+      type: object
+      required: [accountId, code]
+      properties:
+        accountId:
+          $ref: '#/components/schemas/Uuid128'
+        code:
+          $ref: '#/components/schemas/TransferCode'
+        flags:
+          type: [array, 'null']
+          uniqueItems: true
+          description: Account flags; absent, null or empty means none.
+          items:
+            $ref: '#/components/schemas/AccountFlag'
+        userData64:
+          type: [integer, 'null']
+          format: int64
+          default: 0
+          description: Back-reference such as the wallet id; absent or null means 0.
+
+    AccountResponse:
+      type: object
+      required: [accountId, status]
+      properties:
+        accountId:
+          $ref: '#/components/schemas/Uuid128'
+        status:
+          type: string
+          enum: [CREATED, EXISTS]
+
+    BalanceResponse:
+      type: object
+      required: [accountId, debitsPosted, creditsPosted, debitsPending, creditsPending, available]
+      description: All amounts are minor units (poisha).
+      properties:
+        accountId:
+          $ref: '#/components/schemas/Uuid128'
+        debitsPosted:
+          type: integer
+          format: int64
+          minimum: 0
+        creditsPosted:
+          type: integer
+          format: int64
+          minimum: 0
+        debitsPending:
+          type: integer
+          format: int64
+          minimum: 0
+        creditsPending:
+          type: integer
+          format: int64
+          minimum: 0
+        available:
+          type: integer
+          format: int64
+          description: creditsPosted - debitsPosted - debitsPending. May be negative.
+
+    FundingRequest:
+      type: object
+      required: [fundingId, accountId, amount]
+      properties:
+        fundingId:
+          $ref: '#/components/schemas/PostingId'
+        accountId:
+          $ref: '#/components/schemas/Uuid128'
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Minor units (poisha).
+          examples: [500000]
+
+    ErrorCode:
+      type: string
+      description: Machine-readable error code (the `code` member of every problem).
+      enum:
+        - VALIDATION_FAILED
+        - INSUFFICIENT_FUNDS
+        - ACCOUNT_NOT_FOUND
+        - PREVIOUSLY_REJECTED
+        - POSTING_CONFLICT
+        - ACCOUNT_CONFLICT
+        - LEDGER_ERROR
+        - INTERNAL_ERROR
+        - LEDGER_TIMEOUT
+        - OVERLOADED
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          examples: ["legs[0].amount"]
+        message:
+          type: string
+          examples: [must be greater than 0]
+
+    ProblemDetail:
+      type: object
+      description: RFC 9457 Problem Details with ledger extension members.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: '`urn:problem:ledger:<code>`.'
+          examples: ["urn:problem:ledger:INSUFFICIENT_FUNDS"]
+        title:
+          type: string
+        status:
+          type: integer
+          format: int32
+          description: The HTTP status code.
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        postingId:
+          $ref: '#/components/schemas/Uuid128'
+        postingStatus:
+          type: string
+          enum: [REJECTED, UNKNOWN]
+          description: REJECTED = definitively not posted (422); UNKNOWN = outcome unknown (503).
+        legIndex:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 8
+          description: 1-based index of the root-cause leg.
+        accountId:
+          $ref: '#/components/schemas/Uuid128'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, OUT_OF_SERVICE, UNKNOWN]

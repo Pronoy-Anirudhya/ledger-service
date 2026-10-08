@@ -6,20 +6,20 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import com.bracits.ledgerservice.api.ApiConstants;
-import com.bracits.ledgerservice.api.account.BalanceResponse;
-import com.bracits.ledgerservice.api.account.CreateAccountRequest;
-import com.bracits.ledgerservice.api.error.ErrorCode;
-import com.bracits.ledgerservice.api.funding.FundingRequest;
-import com.bracits.ledgerservice.api.posting.LegRequest;
-import com.bracits.ledgerservice.api.posting.PostingRequest;
-import com.bracits.ledgerservice.api.posting.PostingResponse;
-import com.bracits.ledgerservice.config.ConfigConstants;
-import com.bracits.ledgerservice.domain.DomainConstants;
-import com.bracits.ledgerservice.domain.account.AccountCreationStatus;
-import com.bracits.ledgerservice.domain.account.AccountFlag;
-import com.bracits.ledgerservice.domain.account.SystemAccount;
-import com.bracits.ledgerservice.domain.posting.PostingStatus;
+import com.bracits.ledgerservice.api.account.dto.BalanceResponse;
+import com.bracits.ledgerservice.api.account.dto.CreateAccountRequest;
+import com.bracits.ledgerservice.api.constant.ApiConstants;
+import com.bracits.ledgerservice.api.error.enums.ErrorCode;
+import com.bracits.ledgerservice.api.funding.dto.FundingRequest;
+import com.bracits.ledgerservice.api.posting.dto.LegRequest;
+import com.bracits.ledgerservice.api.posting.dto.PostingRequest;
+import com.bracits.ledgerservice.api.posting.dto.PostingResponse;
+import com.bracits.ledgerservice.config.constant.ConfigConstants;
+import com.bracits.ledgerservice.domain.account.enums.AccountCreationStatus;
+import com.bracits.ledgerservice.domain.account.enums.AccountFlag;
+import com.bracits.ledgerservice.domain.account.enums.SystemAccount;
+import com.bracits.ledgerservice.domain.constant.DomainConstants;
+import com.bracits.ledgerservice.domain.posting.enums.PostingStatus;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
@@ -35,6 +35,7 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.ResultMatcher;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
@@ -45,7 +46,8 @@ import tools.jackson.databind.json.JsonMapper;
 
 /**
  * End-to-end against a real single-replica TigerBeetle 0.17.9: the HTTP API, the posting path, the
- * adapter, result mapping and the chart-of-accounts bootstrap. Skipped automatically without Docker.
+ * adapter, result mapping and the chart-of-accounts bootstrap. Skipped automatically without
+ * Docker.
  */
 @Testcontainers(disabledWithoutDocker = true)
 @SpringBootTest
@@ -56,8 +58,10 @@ class TigerBeetleLedgerIT {
   private static final String IMAGE = "ghcr.io/tigerbeetle/tigerbeetle:0.17.9";
   private static final int TB_PORT = 3000;
   private static final String SECCOMP_UNCONFINED = "seccomp=unconfined";
+  private static final String LISTENING_LOG = ".*listening on.*";
   private static final String FORMAT_AND_START =
-      "/tigerbeetle format --cluster=0 --replica=0 --replica-count=1 --development /tmp/0_0.tigerbeetle"
+      "/tigerbeetle format --cluster=0 --replica=0 --replica-count=1 --development"
+          + " /tmp/0_0.tigerbeetle"
           + " && exec /tigerbeetle start --addresses=0.0.0.0:3000 --development --cache-grid=256MiB"
           + " /tmp/0_0.tigerbeetle";
 
@@ -78,7 +82,8 @@ class TigerBeetleLedgerIT {
                 cmd.getHostConfig().withSecurityOpts(List.of(SECCOMP_UNCONFINED));
               })
           .withExposedPorts(TB_PORT)
-          .waitingFor(Wait.forLogMessage(".*listening on.*", 1).withStartupTimeout(Duration.ofMinutes(2)));
+          .waitingFor(
+              Wait.forLogMessage(LISTENING_LOG, 1).withStartupTimeout(Duration.ofMinutes(2)));
 
   @DynamicPropertySource
   static void tigerBeetle(DynamicPropertyRegistry registry) {
@@ -87,14 +92,17 @@ class TigerBeetleLedgerIT {
         () -> TIGERBEETLE.getHost() + ":" + TIGERBEETLE.getMappedPort(TB_PORT));
   }
 
-  @Autowired private MockMvc mvc;
-  @Autowired private JsonMapper json;
+  @Autowired
+  private MockMvc mvc;
+  @Autowired
+  private JsonMapper json;
 
   @Test
   void bootstrapCreatedTheSystemAccountsAndReadinessIsUp() throws Exception {
     for (SystemAccount account : SystemAccount.values()) {
       balance(account.id());
     }
+
     mvc.perform(get("/actuator/health/readiness")).andExpect(status().isOk());
     mvc.perform(get("/openapi.yaml")).andExpect(status().isOk());
   }
@@ -102,12 +110,11 @@ class TigerBeetleLedgerIT {
   @Test
   void createAccountIsIdempotentAndDetectsConflicts() throws Exception {
     UUID id = randomId();
+
     createWallet(id, 7L, status().isCreated(), AccountCreationStatus.CREATED);
     createWallet(id, 7L, status().isOk(), AccountCreationStatus.EXISTS);
-    mvc.perform(
-            post(ApiConstants.ACCOUNTS_PATH)
-                .contentType(MediaType.APPLICATION_JSON)
-                .content(json.writeValueAsString(new CreateAccountRequest(id, WALLET_CODE, Set.of(), 8L))))
+
+    postJson(ApiConstants.ACCOUNTS_PATH, new CreateAccountRequest(id, WALLET_CODE, Set.of(), 8L))
         .andExpect(status().isConflict())
         .andExpect(jsonPath("$.code").value(ErrorCode.ACCOUNT_CONFLICT.name()));
   }
@@ -122,6 +129,7 @@ class TigerBeetleLedgerIT {
     BalanceResponse commissionBefore = balance(SystemAccount.COMMISSION_PAYABLE.id());
 
     PostingRequest request = sendMoney(randomId(), sender, receiver, 100_000L);
+
     PostingResponse posted = postOk(request);
 
     assertThat(posted.status()).isEqualTo(PostingStatus.POSTED);
@@ -135,8 +143,8 @@ class TigerBeetleLedgerIT {
     assertThat(balance(SystemAccount.VAT_PAYABLE.id()).creditsPosted() - vatBefore.creditsPosted())
         .isEqualTo(65L);
     assertThat(
-            balance(SystemAccount.COMMISSION_PAYABLE.id()).creditsPosted()
-                - commissionBefore.creditsPosted())
+        balance(SystemAccount.COMMISSION_PAYABLE.id()).creditsPosted()
+            - commissionBefore.creditsPosted())
         .isEqualTo(87L);
 
     mvc.perform(
@@ -155,7 +163,8 @@ class TigerBeetleLedgerIT {
     BalanceResponse feeBefore = balance(SystemAccount.FEE_INCOME.id());
 
     PostingRequest request = sendMoney(randomId(), sender, receiver, 100_000L);
-    mvc.perform(post(ApiConstants.POSTINGS_PATH).contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(request)))
+
+    postJson(ApiConstants.POSTINGS_PATH, request)
         .andExpect(status().isUnprocessableContent())
         .andExpect(jsonPath("$.code").value(ErrorCode.INSUFFICIENT_FUNDS.name()))
         .andExpect(jsonPath("$.postingStatus").value(PostingStatus.REJECTED.name()))
@@ -164,7 +173,8 @@ class TigerBeetleLedgerIT {
     assertThat(balance(sender).available()).isEqualTo(1_000L);
     assertThat(balance(sender).debitsPosted()).isZero();
     assertThat(balance(receiver).creditsPosted()).isZero();
-    assertThat(balance(SystemAccount.FEE_INCOME.id()).creditsPosted()).isEqualTo(feeBefore.creditsPosted());
+    assertThat(balance(SystemAccount.FEE_INCOME.id()).creditsPosted())
+        .isEqualTo(feeBefore.creditsPosted());
     mvc.perform(
             get(ApiConstants.POSTINGS_PATH + "/" + request.postingId())
                 .param(ApiConstants.QUERY_LEGS, "4"))
@@ -172,7 +182,7 @@ class TigerBeetleLedgerIT {
         .andExpect(jsonPath("$.status").value(PostingStatus.NOT_FOUND.name()));
 
     // TigerBeetle remembers the failed transfer id: a retry is a definitive 422 (never a 5xx).
-    mvc.perform(post(ApiConstants.POSTINGS_PATH).contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(request)))
+    postJson(ApiConstants.POSTINGS_PATH, request)
         .andExpect(status().isUnprocessableContent())
         .andExpect(jsonPath("$.code").value(ErrorCode.PREVIOUSLY_REJECTED.name()))
         .andExpect(jsonPath("$.legIndex").value(1));
@@ -185,6 +195,7 @@ class TigerBeetleLedgerIT {
     fund(sender, 100_500L);
 
     PostingRequest request = sendMoney(randomId(), sender, receiver, 100_000L);
+
     PostingResponse first = postOk(request);
     PostingResponse replay = postOk(request);
 
@@ -210,15 +221,15 @@ class TigerBeetleLedgerIT {
 
   private PostingResponse postOk(PostingRequest request) throws Exception {
     MvcResult result =
-        mvc.perform(post(ApiConstants.POSTINGS_PATH).contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(request)))
-            .andExpect(status().isOk())
-            .andReturn();
+        postJson(ApiConstants.POSTINGS_PATH, request).andExpect(status().isOk()).andReturn();
+
     return json.readValue(result.getResponse().getContentAsString(), PostingResponse.class);
   }
 
   private UUID newWallet(long walletId) throws Exception {
     UUID id = randomId();
     createWallet(id, walletId, status().isCreated(), AccountCreationStatus.CREATED);
+
     return id;
   }
 
@@ -229,15 +240,18 @@ class TigerBeetleLedgerIT {
       AccountCreationStatus expected)
       throws Exception {
     CreateAccountRequest request =
-        new CreateAccountRequest(id, WALLET_CODE, Set.of(AccountFlag.DEBITS_MUST_NOT_EXCEED_CREDITS), walletId);
-    mvc.perform(post(ApiConstants.ACCOUNTS_PATH).contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(request)))
+        new CreateAccountRequest(
+            id, WALLET_CODE, Set.of(AccountFlag.DEBITS_MUST_NOT_EXCEED_CREDITS), walletId);
+
+    postJson(ApiConstants.ACCOUNTS_PATH, request)
         .andExpect(expectedStatus)
         .andExpect(jsonPath("$.status").value(expected.name()));
   }
 
   private void fund(UUID account, long amount) throws Exception {
     FundingRequest request = new FundingRequest(randomId(), account, amount);
-    mvc.perform(post(ApiConstants.FUNDINGS_PATH).contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(request)))
+
+    postJson(ApiConstants.FUNDINGS_PATH, request)
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.status").value(PostingStatus.POSTED.name()));
   }
@@ -247,12 +261,21 @@ class TigerBeetleLedgerIT {
         mvc.perform(get(ApiConstants.ACCOUNTS_PATH + "/" + account + "/balance"))
             .andExpect(status().isOk())
             .andReturn();
+
     return json.readValue(result.getResponse().getContentAsString(), BalanceResponse.class);
   }
 
-  /** Random 128-bit id with the low byte cleared (free for the leg index). */
+  private ResultActions postJson(String path, Object body) throws Exception {
+    return mvc.perform(
+        post(path).contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(body)));
+  }
+
+  /**
+   * Random 128-bit id with the low byte cleared (free for the leg index).
+   */
   private static UUID randomId() {
     ThreadLocalRandom random = ThreadLocalRandom.current();
+
     return new UUID(random.nextLong(), random.nextLong() & ~DomainConstants.LEG_INDEX_MASK);
   }
 }

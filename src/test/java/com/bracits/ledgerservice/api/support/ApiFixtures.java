@@ -3,7 +3,9 @@ package com.bracits.ledgerservice.api.support;
 import java.util.Collections;
 import java.util.UUID;
 
-/** Request bodies and ids shared by the API tests. */
+/**
+ * Request bodies and ids shared by the API tests.
+ */
 public final class ApiFixtures {
 
   public static final UUID POSTING_ID = UUID.fromString("0192f5a4-0000-7000-8000-00000000ab00");
@@ -12,7 +14,8 @@ public final class ApiFixtures {
   public static final UUID FEE_INCOME = UUID.fromString("00000000-0000-0000-0000-0000000000c8");
   public static final UUID ZERO = new UUID(0L, 0L);
 
-  private ApiFixtures() {}
+  private ApiFixtures() {
+  }
 
   public static String leg(UUID debit, UUID credit, long amount, int code) {
     return """
@@ -30,12 +33,16 @@ public final class ApiFixtures {
         .formatted(postingId, String.join(",", legs));
   }
 
-  /** A valid two-leg posting. */
+  /**
+   * A valid two-leg posting.
+   */
   public static String validPosting() {
     return posting(POSTING_ID, principalLeg(), leg(SENDER, FEE_INCOME, 348, 11));
   }
 
-  /** A posting with {@code count} identical principal legs. */
+  /**
+   * A posting with {@code count} identical principal legs.
+   */
   public static String postingWithLegs(int count) {
     return posting(POSTING_ID, Collections.nCopies(count, principalLeg()).toArray(String[]::new));
   }

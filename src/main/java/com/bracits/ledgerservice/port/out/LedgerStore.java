@@ -1,15 +1,18 @@
 package com.bracits.ledgerservice.port.out;
 
-import com.bracits.ledgerservice.domain.account.Account;
-import com.bracits.ledgerservice.domain.account.AccountCreation;
-import com.bracits.ledgerservice.domain.account.Balance;
-import com.bracits.ledgerservice.domain.posting.Posting;
-import com.bracits.ledgerservice.domain.posting.PostingLookup;
-import com.bracits.ledgerservice.domain.posting.PostingOutcome;
+import com.bracits.ledgerservice.domain.account.model.Account;
+import com.bracits.ledgerservice.domain.account.model.AccountCreation;
+import com.bracits.ledgerservice.domain.account.model.Balance;
+import com.bracits.ledgerservice.domain.posting.model.Posting;
+import com.bracits.ledgerservice.domain.posting.model.PostingLookup;
+import com.bracits.ledgerservice.domain.posting.model.PostingOutcome;
+import com.bracits.ledgerservice.port.out.exception.LedgerUnavailableException;
 import java.util.Optional;
 import java.util.UUID;
 
-/** Outbound port to the ledger (TigerBeetle). Every operation is idempotent and safe to retry. */
+/**
+ * Outbound port to the ledger (TigerBeetle). Every operation is idempotent and safe to retry.
+ */
 public interface LedgerStore {
 
   /**

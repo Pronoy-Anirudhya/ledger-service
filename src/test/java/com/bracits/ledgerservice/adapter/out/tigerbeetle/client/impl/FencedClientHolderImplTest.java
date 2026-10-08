@@ -1,4 +1,4 @@
-package com.bracits.ledgerservice.adapter.out.tigerbeetle;
+package com.bracits.ledgerservice.adapter.out.tigerbeetle.client.impl;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -7,10 +7,15 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
-import com.bracits.ledgerservice.adapter.out.tigerbeetle.FencedClientHolder.Operation;
-import com.bracits.ledgerservice.config.TigerBeetleProperties;
-import com.bracits.ledgerservice.port.out.LedgerUnavailableException;
+import com.bracits.ledgerservice.adapter.out.tigerbeetle.client.TigerBeetleClientFactory;
+import com.bracits.ledgerservice.adapter.out.tigerbeetle.constant.TigerBeetleConstants;
+import com.bracits.ledgerservice.adapter.out.tigerbeetle.enums.RequestResult;
+import com.bracits.ledgerservice.adapter.out.tigerbeetle.enums.TigerBeetleOperation;
+import com.bracits.ledgerservice.adapter.out.tigerbeetle.metrics.impl.TigerBeetleRequestMetricsImpl;
+import com.bracits.ledgerservice.config.properties.TigerBeetleProperties;
+import com.bracits.ledgerservice.port.out.exception.LedgerUnavailableException;
 import com.tigerbeetle.Client;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
@@ -25,11 +30,11 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-class FencedClientHolderTest {
+class FencedClientHolderImplTest {
 
   private static final Duration DEADLINE = Duration.ofMillis(50);
   private static final String OK = "ok";
@@ -37,17 +42,14 @@ class FencedClientHolderTest {
   private final SimpleMeterRegistry registry = new SimpleMeterRegistry();
   private final List<Client> created = new CopyOnWriteArrayList<>();
   private final AtomicBoolean factoryFails = new AtomicBoolean();
-  private final Supplier<Client> factory =
-      () -> {
-        if (factoryFails.get()) {
-          throw new IllegalStateException("cannot create client");
-        }
-        Client client = mock(Client.class);
-        created.add(client);
-        return client;
-      };
+  private final TigerBeetleClientFactory factory = mock(TigerBeetleClientFactory.class);
 
-  private FencedClientHolder holder;
+  private FencedClientHolderImpl holder;
+
+  @BeforeEach
+  void stubFactory() {
+    when(factory.create()).thenAnswer(invocation -> newMockClient());
+  }
 
   @AfterEach
   void clearInterrupt() {
@@ -58,13 +60,16 @@ class FencedClientHolderTest {
   void successReturnsTheResponse() {
     holder = newHolder();
 
-    String response = holder.call(Operation.LOOKUP_ACCOUNTS, client -> CompletableFuture.completedFuture(OK));
+    String response =
+        holder.call(
+            TigerBeetleOperation.LOOKUP_ACCOUNTS, client -> CompletableFuture.completedFuture(OK));
 
     assertThat(response).isEqualTo(OK);
     assertThat(fenceCount()).isZero();
     assertThat(created).hasSize(1);
     verify(created.getFirst(), never()).close();
-    assertThat(requestCount(Operation.LOOKUP_ACCOUNTS, "success")).isEqualTo(1);
+    assertThat(requestCount(TigerBeetleOperation.LOOKUP_ACCOUNTS, RequestResult.SUCCESS))
+        .isEqualTo(1);
   }
 
   @Test
@@ -72,14 +77,18 @@ class FencedClientHolderTest {
     holder = newHolder();
     Client old = created.getFirst();
 
-    assertThatThrownBy(() -> holder.call(Operation.CREATE_TRANSFERS, client -> new CompletableFuture<>()))
+    assertThatThrownBy(
+        () ->
+            holder.call(
+                TigerBeetleOperation.CREATE_TRANSFERS, client -> new CompletableFuture<>()))
         .isInstanceOf(LedgerUnavailableException.class)
         .hasMessage(TigerBeetleConstants.REASON_TIMEOUT);
 
     assertThat(fenceCount()).isEqualTo(1);
     assertThat(created).hasSize(2);
     verify(old, timeout(2_000)).close();
-    assertThat(requestCount(Operation.CREATE_TRANSFERS, "timeout")).isEqualTo(1);
+    assertThat(requestCount(TigerBeetleOperation.CREATE_TRANSFERS, RequestResult.TIMEOUT))
+        .isEqualTo(1);
     assertThat(usedClient()).isSameAs(created.get(1));
   }
 
@@ -89,10 +98,10 @@ class FencedClientHolderTest {
     Client old = created.getFirst();
 
     assertThatThrownBy(
-            () ->
-                holder.call(
-                    Operation.LOOKUP_TRANSFERS,
-                    client -> CompletableFuture.failedFuture(new RuntimeException("evicted"))))
+        () ->
+            holder.call(
+                TigerBeetleOperation.LOOKUP_TRANSFERS,
+                client -> CompletableFuture.failedFuture(new RuntimeException("evicted"))))
         .isInstanceOf(LedgerUnavailableException.class)
         .hasMessage(TigerBeetleConstants.REASON_CLIENT_ERROR);
 
@@ -107,12 +116,12 @@ class FencedClientHolderTest {
     Client old = created.getFirst();
 
     assertThatThrownBy(
-            () ->
-                holder.call(
-                    Operation.CREATE_ACCOUNTS,
-                    client -> {
-                      throw new IllegalStateException("closed");
-                    }))
+        () ->
+            holder.call(
+                TigerBeetleOperation.CREATE_ACCOUNTS,
+                client -> {
+                  throw new IllegalStateException("closed");
+                }))
         .isInstanceOf(LedgerUnavailableException.class);
 
     assertThat(fenceCount()).isEqualTo(1);
@@ -125,7 +134,10 @@ class FencedClientHolderTest {
     Client old = created.getFirst();
     Thread.currentThread().interrupt();
 
-    assertThatThrownBy(() -> holder.call(Operation.LOOKUP_ACCOUNTS, client -> new CompletableFuture<>()))
+    assertThatThrownBy(
+        () ->
+            holder.call(
+                TigerBeetleOperation.LOOKUP_ACCOUNTS, client -> new CompletableFuture<>()))
         .isInstanceOf(LedgerUnavailableException.class)
         .hasMessage(TigerBeetleConstants.REASON_INTERRUPTED);
 
@@ -142,16 +154,19 @@ class FencedClientHolderTest {
     CountDownLatch start = new CountDownLatch(1);
     // Every thread must have sent its request on the old client before any of them times out.
     CyclicBarrier allSent = new CyclicBarrier(threads);
+
     try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
       List<Future<Throwable>> results = new CopyOnWriteArrayList<>();
+
       for (int i = 0; i < threads; i++) {
         results.add(
             executor.submit(
                 () -> {
                   start.await();
+
                   try {
                     holder.call(
-                        Operation.CREATE_TRANSFERS,
+                        TigerBeetleOperation.CREATE_TRANSFERS,
                         client -> {
                           assertThat(client).isSameAs(old);
                           awaitQuietly(allSent);
@@ -163,7 +178,9 @@ class FencedClientHolderTest {
                   }
                 }));
       }
+
       start.countDown();
+
       for (Future<Throwable> result : results) {
         assertThat(result.get(5, TimeUnit.SECONDS)).isInstanceOf(LedgerUnavailableException.class);
       }
@@ -171,7 +188,9 @@ class FencedClientHolderTest {
 
     assertThat(fenceCount()).isEqualTo(1);
     verify(old, timeout(2_000)).close();
+
     Client current = usedClient();
+
     assertThat(current).isNotSameAs(old);
     for (Client client : created) {
       if (client != current && client != old) {
@@ -188,15 +207,22 @@ class FencedClientHolderTest {
     Client old = created.getFirst();
     factoryFails.set(true);
 
-    assertThatThrownBy(() -> holder.call(Operation.CREATE_TRANSFERS, client -> new CompletableFuture<>()))
+    assertThatThrownBy(
+        () ->
+            holder.call(
+                TigerBeetleOperation.CREATE_TRANSFERS, client -> new CompletableFuture<>()))
         .isInstanceOf(LedgerUnavailableException.class);
     verify(old, timeout(2_000)).close();
 
-    assertThatThrownBy(() -> holder.call(Operation.CREATE_TRANSFERS, client -> new CompletableFuture<>()))
+    assertThatThrownBy(
+        () ->
+            holder.call(
+                TigerBeetleOperation.CREATE_TRANSFERS, client -> new CompletableFuture<>()))
         .isInstanceOf(LedgerUnavailableException.class)
         .hasMessage(TigerBeetleConstants.REASON_NO_CLIENT);
 
     factoryFails.set(false);
+
     assertThat(usedClient()).isSameAs(created.get(1));
   }
 
@@ -207,15 +233,12 @@ class FencedClientHolderTest {
     holder.close();
 
     verify(created.getFirst()).close();
-    assertThatThrownBy(() -> holder.call(Operation.LOOKUP_ACCOUNTS, client -> CompletableFuture.completedFuture(OK)))
+    assertThatThrownBy(
+        () ->
+            holder.call(
+                TigerBeetleOperation.LOOKUP_ACCOUNTS,
+                client -> CompletableFuture.completedFuture(OK)))
         .isInstanceOf(LedgerUnavailableException.class);
-  }
-
-  @Test
-  void resolvesHostnamesToIpAddresses() {
-    assertThat(FencedClientHolder.resolve("localhost:3000")).isIn("127.0.0.1:3000", "[::1]:3000");
-    assertThat(FencedClientHolder.resolve("10.0.0.5:3001")).isEqualTo("10.0.0.5:3001");
-    assertThat(FencedClientHolder.resolve("3000")).isEqualTo("3000");
   }
 
   private static void awaitQuietly(CyclicBarrier barrier) {
@@ -226,20 +249,38 @@ class FencedClientHolderTest {
     }
   }
 
-  private FencedClientHolder newHolder() {
-    return new FencedClientHolder(
-        new TigerBeetleProperties(0L, List.of("127.0.0.1:3000"), DEADLINE, 1), registry, factory);
+  private Client newMockClient() {
+    if (factoryFails.get()) {
+      throw new IllegalStateException("cannot create client");
+    }
+
+    Client client = mock(Client.class);
+    created.add(client);
+
+    return client;
   }
 
-  /** Makes one successful call and returns the client it used. */
+  private FencedClientHolderImpl newHolder() {
+    TigerBeetleProperties properties =
+        new TigerBeetleProperties(0L, List.of("127.0.0.1:3000"), DEADLINE, 1);
+
+    return new FencedClientHolderImpl(
+        properties, factory, new TigerBeetleRequestMetricsImpl(registry));
+  }
+
+  /**
+   * Makes one successful call and returns the client it used.
+   */
   private Client usedClient() {
     AtomicReference<Client> used = new AtomicReference<>();
+
     holder.call(
-        Operation.LOOKUP_ACCOUNTS,
+        TigerBeetleOperation.LOOKUP_ACCOUNTS,
         client -> {
           used.set(client);
           return CompletableFuture.completedFuture(OK);
         });
+
     return used.get();
   }
 
@@ -247,11 +288,11 @@ class FencedClientHolderTest {
     return registry.get(TigerBeetleConstants.METRIC_CLIENT_FENCE).counter().count();
   }
 
-  private long requestCount(Operation operation, String result) {
+  private long requestCount(TigerBeetleOperation operation, RequestResult result) {
     return registry
         .get(TigerBeetleConstants.METRIC_TB_REQUEST)
         .tag(TigerBeetleConstants.TAG_OPERATION, operation.tagValue())
-        .tag(TigerBeetleConstants.TAG_RESULT, result)
+        .tag(TigerBeetleConstants.TAG_RESULT, result.tagValue())
         .timer()
         .count();
   }

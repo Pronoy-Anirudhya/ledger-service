@@ -1,4 +1,4 @@
-package com.bracits.ledgerservice.adapter.out.tigerbeetle;
+package com.bracits.ledgerservice.adapter.out.tigerbeetle.mapper.impl;
 
 import static com.tigerbeetle.CreateTransferStatus.Created;
 import static com.tigerbeetle.CreateTransferStatus.CreditAccountNotFound;
@@ -8,15 +8,12 @@ import static com.tigerbeetle.CreateTransferStatus.Exists;
 import static com.tigerbeetle.CreateTransferStatus.IdAlreadyFailed;
 import static com.tigerbeetle.CreateTransferStatus.LinkedEventFailed;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.bracits.ledgerservice.adapter.out.tigerbeetle.ResultMapper.ChainResult;
-import com.bracits.ledgerservice.adapter.out.tigerbeetle.ResultMapper.LegResult;
-import com.bracits.ledgerservice.domain.account.AccountCreationStatus;
-import com.bracits.ledgerservice.domain.posting.PostingOutcome;
-import com.bracits.ledgerservice.domain.posting.RejectionCode;
-import com.bracits.ledgerservice.port.out.LedgerErrorException;
-import com.tigerbeetle.CreateAccountStatus;
+import com.bracits.ledgerservice.adapter.out.tigerbeetle.model.ChainResult;
+import com.bracits.ledgerservice.adapter.out.tigerbeetle.model.LegLookup;
+import com.bracits.ledgerservice.adapter.out.tigerbeetle.model.LegResult;
+import com.bracits.ledgerservice.domain.posting.enums.RejectionCode;
+import com.bracits.ledgerservice.domain.posting.model.PostingOutcome;
 import com.tigerbeetle.CreateTransferStatus;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -27,9 +24,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
-class ResultMapperTest {
+class TransferResultMapperImplTest {
 
-  private final ResultMapper mapper = new ResultMapper();
+  private final TransferResultMapperImpl mapper = new TransferResultMapperImpl();
 
   @Test
   void allCreatedIsPostedWithLastLegTimestamp() {
@@ -87,7 +84,8 @@ class ResultMapperTest {
   @ParameterizedTest
   @EnumSource(names = {"DebitAccountNotFound", "CreditAccountNotFound"})
   void accountNotFound(CreateTransferStatus status) {
-    List<LegResult> results = List.of(leg(LinkedEventFailed, 0), leg(LinkedEventFailed, 0), leg(status, 0));
+    List<LegResult> results =
+        List.of(leg(LinkedEventFailed, 0), leg(LinkedEventFailed, 0), leg(status, 0));
 
     assertThat(mapper.mapTransfers(results, 3))
         .isEqualTo(decided(new PostingOutcome.Rejected(RejectionCode.ACCOUNT_NOT_FOUND, 3)));
@@ -156,56 +154,17 @@ class ResultMapperTest {
 
   @Test
   void replayVerificationAllFoundIsReplay() {
-    var lookup = new TigerBeetleMapper.LegLookup(3, TigerBeetleMapper.NO_MISSING_LEG, 99);
+    LegLookup lookup = new LegLookup(3, LegLookup.NO_MISSING_LEG, 99);
 
     assertThat(mapper.mapReplayVerification(lookup)).isEqualTo(new PostingOutcome.Posted(99, true));
   }
 
   @Test
   void replayVerificationMissingLegIsConflict() {
-    var lookup = new TigerBeetleMapper.LegLookup(3, 2, 0);
+    LegLookup lookup = new LegLookup(3, 2, 0);
 
     assertThat(mapper.mapReplayVerification(lookup))
         .isEqualTo(new PostingOutcome.Rejected(RejectionCode.POSTING_CONFLICT, 2));
-  }
-
-  @Test
-  void accountCreated() {
-    assertThat(mapper.mapAccount(CreateAccountStatus.Created)).isEqualTo(AccountCreationStatus.CREATED);
-    assertThat(mapper.mapAccount(List.of(CreateAccountStatus.Created)))
-        .isEqualTo(AccountCreationStatus.CREATED);
-  }
-
-  @Test
-  void accountExists() {
-    assertThat(mapper.mapAccount(CreateAccountStatus.Exists)).isEqualTo(AccountCreationStatus.EXISTS);
-  }
-
-  @ParameterizedTest
-  @EnumSource(
-      value = CreateAccountStatus.class,
-      names = "ExistsWithDifferent.*",
-      mode = EnumSource.Mode.MATCH_ALL)
-  void accountExistsWithDifferentIsConflict(CreateAccountStatus status) {
-    assertThat(mapper.mapAccount(status)).isEqualTo(AccountCreationStatus.CONFLICT);
-  }
-
-  @ParameterizedTest
-  @EnumSource(
-      value = CreateAccountStatus.class,
-      names = {"Created", "Exists", "ExistsWithDifferent.*"},
-      mode = EnumSource.Mode.MATCH_NONE)
-  void otherAccountStatusThrows(CreateAccountStatus status) {
-    assertThatThrownBy(() -> mapper.mapAccount(status)).isInstanceOf(LedgerErrorException.class);
-  }
-
-  @Test
-  void accountResultCountMismatchThrows() {
-    assertThatThrownBy(() -> mapper.mapAccount(List.<CreateAccountStatus>of()))
-        .isInstanceOf(LedgerErrorException.class);
-    assertThatThrownBy(
-            () -> mapper.mapAccount(List.of(CreateAccountStatus.Created, CreateAccountStatus.Created)))
-        .isInstanceOf(LedgerErrorException.class);
   }
 
   static Stream<CreateTransferStatus> existsWithDifferentStatuses() {
@@ -224,6 +183,7 @@ class ResultMapperTest {
                 DebitAccountNotFound,
                 CreditAccountNotFound,
                 IdAlreadyFailed));
+
     return Arrays.stream(CreateTransferStatus.values())
         .filter(s -> !mapped.contains(s))
         .filter(s -> !s.name().startsWith("ExistsWithDifferent"));
